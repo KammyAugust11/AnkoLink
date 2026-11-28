@@ -1,0 +1,412 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.2.3)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build & sign Windows (x64)
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+      MUSE_CONNECTOR_REQUIRE_SYMLINK_TESTS: "1"
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: meta
+        shell: pwsh
+        run: |
+          $tag = if ("${{ github.event_name }}" -eq "workflow_dispatch") { "${{ inputs.tag }}" } else { "${{ github.ref_name }}" }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+') {
+            throw "Invalid release tag: $tag"
+          }
+          $version = $tag.TrimStart('v')
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Verify updater signing secret
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            throw "Missing repository secret TAURI_SIGNING_PRIVATE_KEY. Configure it before creating a signed release."
+          }
+
+      - name: Enable Developer Mode for symlink coverage
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $key = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock'
+          if (-not (Test-Path -LiteralPath $key)) {
+            New-Item -Path $key -Force | Out-Null
+          }
+          New-ItemProperty -LiteralPath $key -Name AllowDevelopmentWithoutDevLicense -PropertyType DWord -Value 1 -Force | Out-Null
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: muse-connector/pnpm-lock.yaml
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: muse-connector/src-tauri
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path muse-connector/src-tauri/Cargo.toml --all -- --check
+
+      - name: Install locked dependencies
+        run: pnpm -C muse-connector install --frozen-lockfile
+
+      - name: Build frontend
+        run: pnpm -C muse-connector build
+
+      - name: Run Rust tests
+        run: cargo test --manifest-path muse-connector/src-tauri/Cargo.toml --locked
+
+      - name: Build connector binary
+        run: pnpm -C muse-connector tauri build --no-bundle --ci
+
+      - name: Package Windows portable zip and signed NSIS installer
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          $version = "${{ steps.meta.outputs.version }}"
+          $work = Join-Path $env:RUNNER_TEMP "muselink-win-$version"
+          $portableDir = Join-Path $work "MuseLink-$version-windows-x64-portable"
+          $outDir = Join-Path $work "out"
+          $null = New-Item -ItemType Directory -Force -Path $outDir
+          $installer = Join-Path $outDir "MuseLink-$version-windows-x64-setup.exe"
+          $sig = "$installer.sig"
+          $zip = Join-Path $outDir "MuseLink-$version-windows-x64-portable.zip"
+          & ./muse-connector/scripts/package-portable.ps1 `
+            -ConnectorExe "muse-connector/src-tauri/target/release/muse-connector.exe" `
+            -Destination $portableDir `
+            -NsisDestination $installer `
+            -SignatureDestination $sig
+          Compress-Archive -Path "$portableDir\*" -DestinationPath $zip -Force
+          "out_dir=$outDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+        id: win_pack
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-assets
+          path: ${{ steps.win_pack.outputs.out_dir }}/*
+          if-no-files-found: error
+
+      - name: Attest Windows artifacts
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ steps.win_pack.outputs.out_dir }}/*
+
+  build-linux:
+    name: Build & sign Linux (x64 AppImage & deb)
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    # 使用 ubuntu-22.04 保障 AppImage 的 glibc 跨发行版兼容性
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+      APPIMAGE_EXTRACT_AND_RUN: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: meta
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${{ github.ref_name }}"
+          fi
+          version="${tag#v}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Verify updater signing secret
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY// }" ]; then
+            echo "Missing repository secret TAURI_SIGNING_PRIVATE_KEY." >&2
+            exit 1
+          fi
+
+      - name: Install Linux Tauri dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config file patchelf \
+            libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev \
+            libsoup-3.0-dev libxdo-dev libssl-dev
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: muse-connector/pnpm-lock.yaml
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: muse-connector/src-tauri
+
+      - name: Install locked dependencies
+        run: pnpm -C muse-connector install --frozen-lockfile
+
+      - name: Build frontend
+        run: pnpm -C muse-connector build
+
+      - name: Run Rust tests on Linux
+        run: cargo test --manifest-path muse-connector/src-tauri/Cargo.toml --locked
+
+      - name: Build signed Linux AppImage and deb
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm -C muse-connector tauri build --bundles appimage,deb --ci
+
+      - name: Stage Linux release assets
+        id: linux_pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.version }}"
+          out_dir="${RUNNER_TEMP}/muselink-linux-${version}"
+          mkdir -p "$out_dir"
+          appimage=$(find muse-connector/src-tauri/target/release/bundle/appimage -maxdepth 1 -type f -name '*.AppImage' | head -n 1)
+          deb=$(find muse-connector/src-tauri/target/release/bundle/deb -maxdepth 1 -type f -name '*.deb' | head -n 1)
+          if [ -z "$appimage" ] || [ ! -f "${appimage}.sig" ]; then
+            echo "Missing Linux AppImage or its .sig updater signature." >&2
+            exit 1
+          fi
+          if [ -z "$deb" ]; then
+            echo "Missing Linux .deb package." >&2
+            exit 1
+          fi
+          cp "$appimage" "${out_dir}/MuseLink-${version}-linux-x64.AppImage"
+          cp "${appimage}.sig" "${out_dir}/MuseLink-${version}-linux-x64.AppImage.sig"
+          cp "$deb" "${out_dir}/MuseLink-${version}-linux-x64.deb"
+          echo "out_dir=${out_dir}" >> "$GITHUB_OUTPUT"
+          ls -lh "$out_dir"
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-assets
+          path: ${{ steps.linux_pack.outputs.out_dir }}/*
+          if-no-files-found: error
+
+      - name: Attest Linux artifacts
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ steps.linux_pack.outputs.out_dir }}/*
+
+  build-macos:
+    name: Build macOS (Universal dmg & app.zip)
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: meta
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${{ github.ref_name }}"
+          fi
+          version="${tag#v}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Add Apple Silicon and Intel Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: muse-connector/pnpm-lock.yaml
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: muse-connector/src-tauri
+
+      - name: Install locked dependencies
+        run: pnpm -C muse-connector install --frozen-lockfile
+
+      - name: Build frontend
+        run: pnpm -C muse-connector build
+
+      - name: Run Rust tests on macOS
+        run: cargo test --manifest-path muse-connector/src-tauri/Cargo.toml --locked
+
+      - name: Build macOS Universal app bundle
+        run: pnpm -C muse-connector tauri build --target universal-apple-darwin --bundles app --config '{"bundle":{"createUpdaterArtifacts":false}}' --ci
+
+      - name: Package macOS Universal dmg and portable app.zip
+        id: macos_pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.version }}"
+          out_dir="${RUNNER_TEMP}/muselink-macos-${version}"
+          dmg_stage="${RUNNER_TEMP}/muselink-macos-dmg-stage-${version}"
+          rm -rf "$out_dir" "$dmg_stage"
+          mkdir -p "$out_dir" "$dmg_stage"
+          app_bundle=$(find muse-connector/src-tauri/target/universal-apple-darwin/release/bundle/macos -maxdepth 1 -type d -name '*.app' | head -n 1)
+          if [ -z "$app_bundle" ] || [ ! -d "$app_bundle" ]; then
+            echo "Missing macOS .app bundle." >&2
+            exit 1
+          fi
+          ditto "$app_bundle" "${dmg_stage}/MuseLink.app"
+          codesign --force --deep --sign - "${dmg_stage}/MuseLink.app"
+          ditto -c -k --sequesterRsrc --keepParent "${dmg_stage}/MuseLink.app" "${out_dir}/MuseLink-${version}-macos-universal.app.zip"
+          ln -s /Applications "${dmg_stage}/Applications"
+          cp LICENSE THIRD_PARTY_NOTICES.md "$dmg_stage/"
+          hdiutil create -volname "MuseLink ${version}" -srcfolder "$dmg_stage" -ov -format UDZO "${out_dir}/MuseLink-${version}-macos-universal.dmg"
+          echo "out_dir=${out_dir}" >> "$GITHUB_OUTPUT"
+          ls -lh "$out_dir"
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-assets
+          path: ${{ steps.macos_pack.outputs.out_dir }}/*
+          if-no-files-found: error
+
+      - name: Attest macOS artifacts
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ steps.macos_pack.outputs.out_dir }}/*
+
+  publish-draft:
+    name: Assemble manifest & create draft Release
+    needs: [build-windows, build-linux, build-macos]
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-assets
+          path: ${{ runner.temp }}/release-inputs/win
+
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-assets
+          path: ${{ runner.temp }}/release-inputs/linux
+
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-assets
+          path: ${{ runner.temp }}/release-inputs/macos
+
+      - name: Generate updater manifest and SHA256SUMS
+        shell: pwsh
+        run: |
+          $tag = "${{ needs.build-windows.outputs.tag }}"
+          $version = "${{ needs.build-windows.outputs.version }}"
+          $winDir = Join-Path $env:RUNNER_TEMP "release-inputs/win"
+          $linuxDir = Join-Path $env:RUNNER_TEMP "release-inputs/linux"
+          $macosDir = Join-Path $env:RUNNER_TEMP "release-inputs/macos"
+          $assetsDir = Join-Path $env:RUNNER_TEMP "release-final-$version"
+          & ./muse-connector/scripts/generate-updater-manifest.ps1 `
+            -Tag $tag `
+            -InstallerPath (Join-Path $winDir "MuseLink-$version-windows-x64-setup.exe") `
+            -SignaturePath (Join-Path $winDir "MuseLink-$version-windows-x64-setup.exe.sig") `
+            -PortableZipPath (Join-Path $winDir "MuseLink-$version-windows-x64-portable.zip") `
+            -LinuxAppImagePath (Join-Path $linuxDir "MuseLink-$version-linux-x64.AppImage") `
+            -LinuxSignaturePath (Join-Path $linuxDir "MuseLink-$version-linux-x64.AppImage.sig") `
+            -LinuxDebPath (Join-Path $linuxDir "MuseLink-$version-linux-x64.deb") `
+            -MacosDmgPath (Join-Path $macosDir "MuseLink-$version-macos-universal.dmg") `
+            -MacosZipPath (Join-Path $macosDir "MuseLink-$version-macos-universal.app.zip") `
+            -OutputDirectory $assetsDir
+          Get-ChildItem -LiteralPath $assetsDir -File | ForEach-Object {
+            Write-Host ("- {0} ({1} bytes)" -f $_.Name, $_.Length)
+          }
+
+      - name: Create draft GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ needs.build-windows.outputs.tag }}"
+          $version = "${{ needs.build-windows.outputs.version }}"
+          $assetsDir = Join-Path $env:RUNNER_TEMP "release-final-$version"
+          $assets = Get-ChildItem -LiteralPath $assetsDir -File | ForEach-Object { $_.FullName }
+          gh release create $tag --draft --title "MuseLink $tag" --generate-notes @assets
+          if ($LASTEXITCODE -ne 0) {
+            throw "gh release create failed with exit code $LASTEXITCODE."
+          }
+          Write-Host "Draft release $tag created with Windows + Linux + macOS assets. Review and Publish when ready."
