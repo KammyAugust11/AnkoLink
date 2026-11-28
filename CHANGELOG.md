@@ -7,6 +7,7 @@
 ## [Unreleased]
 
 ### 安全与稳定性加固
+- **发布产物增加构建来源证明**：发布工作流为 Windows / Linux / macOS 三个平台的发布资产生成 GitHub 构建来源证明（build provenance attestation），用户可通过 `gh attestation verify` 校验下载的二进制确实由本仓库源码在 GitHub Actions 中构建，未被替换或篡改。
 - **扩大默认读取保护范围**：`.npmrc`、`.pypirc` 由仅写保护升级为读 / 搜索 / 写全面保护；新增对 `.docker`、`.kube`、`.azure`、gcloud 凭证目录以及各平台浏览器凭证库的默认保护（Windows：Chrome / Edge 的 `User Data` 与 Firefox 的 `Profiles`；macOS：Application Support 下的 Chrome / Edge / Firefox，配合既有 `~/Library/Keychains` 保护；Linux：`google-chrome` / `chromium` / `microsoft-edge` 与 `.mozilla/firefox`），避免磁盘授权或主目录授权时令牌与登录数据被读取。
 
 ## [v0.3.1] - 2026-11-27
